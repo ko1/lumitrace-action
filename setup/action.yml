@@ -1,0 +1,114 @@
+name: Lumitrace Setup
+description: >-
+  Enable lumitrace for the steps that follow by injecting env vars into
+  $GITHUB_ENV. The existing test step gets traced (diff range only) without
+  changing its command. Fetches the lumitrace gem source at run time (no
+  `gem install`) and puts its lib/ on RUBYLIB. Also fetches the PR base commit
+  itself when missing, so the default shallow checkout works (no fetch-depth: 0).
+inputs:
+  collect-mode:
+    description: "last | types | history (default types: keeps raw values out of the public PR view)"
+    default: "types"
+  output:
+    description: "Path for the JSON trace output (must match the report action's `output`)."
+    default: "lumitrace.json"
+  html:
+    description: "Path for the self-contained HTML report (uploaded by the report action when a backend is set)."
+    default: "lumitrace.html"
+  diff:
+    description: >-
+      LUMITRACE_GIT_DIFF value (working | staged | base:REV | range:SPEC).
+      Empty = derive from the event (PR base sha, else push `before`, else `working`).
+    default: ""
+  lumitrace-ref:
+    description: >-
+      Git ref (tag) of ko1/lumitrace to trace with. Empty = the latest released
+      vX.Y.Z tag. Pin to a specific tag (e.g. v0.7.0) for fully reproducible runs.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        # --- Obtain the lumitrace gem source -------------------------------
+        # This action is versioned independently of the gem (separate repo), so
+        # it fetches the gem source at run time rather than shipping a copy. No
+        # `gem install`: we shallow-clone the source and put its lib/ on RUBYLIB,
+        # exactly as a co-located checkout used to. Pinned to the latest released
+        # tag by default; override with `lumitrace-ref` for reproducible runs.
+        REPO="https://github.com/ko1/lumitrace"
+        REF="${{ inputs.lumitrace-ref }}"
+        if [ -z "$REF" ]; then
+          # Highest vX.Y.Z semver tag. Filter to X.Y.Z so a bare major float
+          # tag (e.g. an action's `v1`) is never mistaken for a gem release.
+          REF="$(git ls-remote --refs --tags "$REPO" 'v*' 2>/dev/null \
+                 | sed 's@.*refs/tags/@@' \
+                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                 | sort -V | tail -1)"
+        fi
+
+        # Fail-safe: tracing must never break the user's build. If we can't fetch
+        # or load the source, warn and skip injecting RUBYOPT so the following
+        # steps run exactly as they would without this action.
+        SRC="${RUNNER_TEMP:-/tmp}/lumitrace-src"
+        if [ -z "$REF" ] || ! git clone --depth 1 --branch "$REF" "$REPO" "$SRC" 2>/dev/null; then
+          echo "::warning title=lumitrace::tracing disabled — could not fetch lumitrace source (ref='${REF:-?}')"
+          exit 0
+        fi
+        LUMI_LIB="$SRC/lib"
+        if ! err="$(ruby -I"$LUMI_LIB" -e 'require "lumitrace"' 2>&1)"; then
+          echo "::warning title=lumitrace::tracing disabled — lumitrace failed to load: ${err##*$'\n'}"
+          exit 0
+        fi
+
+        DIFF="${{ inputs.diff }}"
+        if [ -z "$DIFF" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -z "$BASE" ] && BASE="${{ github.event.before }}"
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            DIFF="base:${BASE}"
+          else
+            DIFF="working"
+          fi
+        fi
+
+        # `git diff base:<sha>` is a tree-to-tree compare — it only needs that one
+        # base commit, not full history. So fetch just it (depth 1) if it's missing,
+        # letting users keep the default shallow checkout (no fetch-depth: 0 needed).
+        case "$DIFF" in
+          base:*)
+            base_rev="${DIFF#base:}"
+            if git -C "$GITHUB_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
+               ! git -C "$GITHUB_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
+              if ! git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null; then
+                echo "::warning title=lumitrace::could not fetch base ${base_rev} — diff range may be empty. Add 'fetch-depth: 0' to actions/checkout (and keep persist-credentials)."
+              fi
+            fi
+            ;;
+        esac
+
+        # One shared results dir for the whole job, with a sentinel parent pid
+        # (0) so EVERY traced process — across every test step, forks and spawns
+        # — just writes its own per-pid result file here and none tries to
+        # finalize. The report action merges them all. This is what lets a job
+        # split its tests across multiple `run:` steps and still get one report.
+        RESULTS_DIR="${RUNNER_TEMP:-/tmp}/lumitrace-results"
+        mkdir -p "$RESULTS_DIR"
+
+        {
+          echo "LUMITRACE_SRC=${SRC}"
+          echo "RUBYLIB=${LUMI_LIB}${RUBYLIB:+:$RUBYLIB}"
+          echo "RUBYOPT=-rlumitrace ${RUBYOPT:-}"
+          echo "LUMITRACE_ENABLE=1"
+          echo "LUMITRACE_JSON=${{ inputs.output }}"
+          echo "LUMITRACE_HTML=${{ inputs.html }}"
+          echo "LUMITRACE_ROOT=${{ github.workspace }}"
+          echo "LUMITRACE_COLLECT_MODE=${{ inputs.collect-mode }}"
+          echo "LUMITRACE_GIT_DIFF=${DIFF}"
+          echo "LUMITRACE_RESULTS_DIR=${RESULTS_DIR}"
+          echo "LUMITRACE_RESULTS_PARENT_PID=0"
+        } >> "$GITHUB_ENV"
+
+        echo "lumitrace enabled: ref=${REF} mode=${{ inputs.collect-mode }} diff=${DIFF} out=${{ inputs.output }} lib=${LUMI_LIB}"
