@@ -155,8 +155,8 @@ jobs:
           include-hidden-files: true
           if-no-files-found: ignore
 
-  lumitrace:
-    needs: test
+  lumitrace-merge:                  # don't name the job `lumitrace` — it would
+    needs: test                     # collide with the Check Run this posts
     if: always()
     runs-on: ubuntu-latest
     steps:
