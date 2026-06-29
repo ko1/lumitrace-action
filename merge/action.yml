@@ -42,20 +42,43 @@ runs:
   using: composite
   steps:
     - shell: bash
+      # All ${{ }} go through env: — never interpolated into the script body.
       env:
         GH_TOKEN: ${{ github.token }}
         LUMITRACE_CHECK_NAME: ${{ inputs.name }}
+        INPUT_RESULTS_DIR: ${{ inputs.results-dir }}
+        INPUT_COLLECT_MODE: ${{ inputs.collect-mode }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_HTML: ${{ inputs.html }}
+        INPUT_ENDPOINT: ${{ inputs.endpoint }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+        INPUT_DIFF: ${{ inputs.diff }}
+        INPUT_LUMITRACE_REF: ${{ inputs.lumitrace-ref }}
+        GH_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        GH_BEFORE: ${{ github.event.before }}
+        GH_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        GH_SHA: ${{ github.sha }}
+        GH_WORKSPACE: ${{ github.workspace }}
       run: |
         set -euo pipefail
 
-        OUT="${{ inputs.output }}"
-        HTML="${{ inputs.html }}"
-        MODE="${{ inputs.collect-mode }}"
-        SRCDIR="${{ inputs.results-dir }}"
+        strip() { printf '%s' "${1//$'\r'/}" | tr -d '\n'; }
+        OUT="$(strip "$INPUT_OUTPUT")"
+        HTML="$(strip "$INPUT_HTML")"
+        DIFF="$(strip "$INPUT_DIFF")"
+        SRCDIR="$(strip "$INPUT_RESULTS_DIR")"
+        case "$INPUT_COLLECT_MODE" in
+          last|types|history) MODE="$INPUT_COLLECT_MODE" ;;
+          *) echo "::warning title=lumitrace::unknown collect-mode '${INPUT_COLLECT_MODE}' — using types"; MODE="types" ;;
+        esac
 
         # --- Obtain the lumitrace gem source (same as setup) ----------------
         REPO="https://github.com/ko1/lumitrace"
-        REF="${{ inputs.lumitrace-ref }}"
+        REF="$(strip "$INPUT_LUMITRACE_REF")"
+        if [ -n "$REF" ] && ! printf '%s' "$REF" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-fA-F]{40})$'; then
+          echo "::warning title=lumitrace::ignoring invalid lumitrace-ref (expected vX.Y.Z or a 40-char commit SHA) — using latest release"
+          REF=""
+        fi
         if [ -z "$REF" ]; then
           REF="$(git ls-remote --refs --tags "$REPO" 'v*' 2>/dev/null \
                  | sed 's@.*refs/tags/@@' \
@@ -71,10 +94,9 @@ runs:
         LUMI_EXE="$SRC/exe/lumitrace"
 
         # --- Diff range for HTML/coverage context (same derivation as setup) -
-        DIFF="${{ inputs.diff }}"
         if [ -z "$DIFF" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-          [ -z "$BASE" ] && BASE="${{ github.event.before }}"
+          BASE="$GH_BASE_SHA"
+          [ -z "$BASE" ] && BASE="$GH_BEFORE"
           if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
             DIFF="base:${BASE}"
           else
@@ -84,9 +106,9 @@ runs:
         case "$DIFF" in
           base:*)
             base_rev="${DIFF#base:}"
-            if git -C "$GITHUB_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
-               ! git -C "$GITHUB_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
-              git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null \
+            if git -C "$GH_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
+               ! git -C "$GH_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
+              git -C "$GH_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null \
                 || echo "::warning title=lumitrace::could not fetch base ${base_rev} — range may be empty. Add 'fetch-depth: 0' to actions/checkout in the merge job."
             fi
             ;;
@@ -109,16 +131,16 @@ runs:
         fi
 
         ruby -I"$LUMI_LIB" "$LUMI_EXE" merge "$FLAT" \
-          --json "$OUT" --html "$HTML" --root "$GITHUB_WORKSPACE" --collect-mode "$MODE" \
+          --json "$OUT" --html "$HTML" --root "$GH_WORKSPACE" --collect-mode "$MODE" \
           ${DIFF:+--git-diff "$DIFF"} || true
 
-        HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-        [ -z "$HEAD_SHA" ] && HEAD_SHA="${{ github.sha }}"
+        HEAD_SHA="$GH_HEAD_SHA"
+        [ -z "$HEAD_SHA" ] && HEAD_SHA="$GH_SHA"
 
         # Upload (when id-token: write) + post the Check Run — shared with report/.
         export LUMITRACE_OUT="$OUT" LUMITRACE_HTML_OUT="$HTML" \
-               LUMITRACE_ENDPOINT="${{ inputs.endpoint }}" \
-               LUMITRACE_AUDIENCE="${{ inputs.audience }}" \
+               LUMITRACE_ENDPOINT="$INPUT_ENDPOINT" \
+               LUMITRACE_AUDIENCE="$INPUT_AUDIENCE" \
                LUMITRACE_HEAD_SHA="$HEAD_SHA" \
-               LUMITRACE_WORKSPACE="${{ github.workspace }}"
+               LUMITRACE_WORKSPACE="$GH_WORKSPACE"
         bash "$GITHUB_ACTION_PATH/../scripts/finalize.sh"

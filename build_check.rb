@@ -19,6 +19,21 @@ MAX_ANNOTATIONS = 50
 # Cap value highlights (one per line) shown in the summary.
 HIGHLIGHT_LIMIT = 10
 
+# The Check summary renders as markdown, and file names / expression names /
+# recorded values come from the traced code (PR-author-controlled on a fork).
+# Neutralise content so it can't break out of its code span / table cell:
+#  - md_code: collapse control chars (newlines break table rows), turn backticks
+#    into a look-alike (they close a code span). Safe inside a list code span.
+#  - md_table_code: additionally entity-escape pipes (they split table cells).
+def md_code(s, limit = 160)
+  s = s.to_s.gsub(/[[:cntrl:]]+/, " ").gsub("`", "ʼ")
+  s.length > limit ? "#{s[0, limit]}…" : s
+end
+
+def md_table_code(s, limit = 120)
+  md_code(s, limit).gsub("|", "&#124;")
+end
+
 json_path, head_sha, root, details_url = ARGV
 if json_path.nil? || head_sha.nil? || root.nil?
   abort "usage: build_check.rb <lumitrace.json> <head_sha> <root> [details_url]"
@@ -53,16 +68,26 @@ covered = events.select { |e| e["total"].to_i.positive? }
 # uncovered changed lines (total==0). Recorded values are deliberately NOT
 # annotated inline: a value on every changed line buries the diff. They live in
 # the summary highlights (Checks tab) and the full HTML report instead.
+#
+# Paths/lines are validated before they reach GitHub: a path outside the repo
+# (absolute, or with `..`/control chars) or a non-positive line number would make
+# the whole check-run create call fail, so such annotations are dropped instead.
 seen_lines = {} # one annotation per (file, line)
 annotations = uncovered.filter_map do |e|
-  key = [e["file"], e["start_line"]]
+  path = relativize.call(e["file"].to_s)
+  line = e["start_line"].to_i
+  next if line < 1
+  next if path.empty? || path.start_with?("/") ||
+          path.split("/").include?("..") || path.match?(/[[:cntrl:]]/)
+
+  key = [path, line]
   next if seen_lines[key]
 
   seen_lines[key] = true
   {
-    "path" => relativize.call(e["file"]),
-    "start_line" => e["start_line"],
-    "end_line" => e["start_line"],
+    "path" => path,
+    "start_line" => line,
+    "end_line" => line,
     "annotation_level" => "warning",
     "title" => "lumitrace: uncovered",
     "message" => "This changed line was never executed in this run (total=0)."
@@ -96,8 +121,8 @@ summary = +"**Lumitrace** traced #{events.size} expression(s) in the changed ran
 unless coverage.empty?
   summary << "| File | Covered | % |\n|---|---|---|\n"
   coverage.each do |c|
-    summary << "| `#{relativize.call(c["file"])}` | " \
-               "#{c["covered_lines"]}/#{c["total_lines"]} | #{c["coverage_percent"]}% |\n"
+    summary << "| `#{md_table_code(relativize.call(c["file"]))}` | " \
+               "#{c["covered_lines"].to_i}/#{c["total_lines"].to_i} | #{md_table_code(c["coverage_percent"].to_s)}% |\n"
   end
 end
 summary << "\n⚠️ #{uncovered.size} changed line(s) never executed.\n" unless uncovered.empty?
@@ -105,9 +130,9 @@ summary << "\n_Showing the first #{MAX_ANNOTATIONS} of #{uncovered.size} uncover
 unless highlights.empty?
   summary << "\n**Highlights**\n"
   highlights.each do |e|
-    loc = "#{relativize.call(e["file"])}:#{e["start_line"]}"
-    name = e["name"] ? "`#{e["name"]}` " : ""
-    summary << "- `#{loc}` #{name}→ #{value_of.call(e)}\n"
+    loc = "#{md_code(relativize.call(e["file"]))}:#{e["start_line"].to_i}"
+    name = e["name"] ? "`#{md_code(e["name"])}` " : ""
+    summary << "- `#{loc}` #{name}→ `#{md_code(value_of.call(e))}`\n"
   end
   summary << "- …and #{all_highlights.size - HIGHLIGHT_LIMIT} more\n" if highlights_truncated
 end

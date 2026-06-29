@@ -29,20 +29,44 @@ runs:
   using: composite
   steps:
     - shell: bash
+      # Pass every expression through env: (never interpolate ${{ }} straight
+      # into the script — that would let a workflow that forwards untrusted data
+      # into an input inject shell). The script only ever reads these as vars.
+      env:
+        INPUT_COLLECT_MODE: ${{ inputs.collect-mode }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_HTML: ${{ inputs.html }}
+        INPUT_DIFF: ${{ inputs.diff }}
+        INPUT_LUMITRACE_REF: ${{ inputs.lumitrace-ref }}
+        GH_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        GH_BEFORE: ${{ github.event.before }}
+        GH_WORKSPACE: ${{ github.workspace }}
       run: |
         set -euo pipefail
 
+        # Strip CR/LF from single-line inputs so they can't smuggle extra lines
+        # into $GITHUB_ENV (each `echo` below is one VAR=VALUE line).
+        strip() { printf '%s' "${1//$'\r'/}" | tr -d '\n'; }
+        OUTPUT="$(strip "$INPUT_OUTPUT")"
+        HTML_OUT="$(strip "$INPUT_HTML")"
+        DIFF="$(strip "$INPUT_DIFF")"
+        case "$INPUT_COLLECT_MODE" in
+          last|types|history) MODE="$INPUT_COLLECT_MODE" ;;
+          *) echo "::warning title=lumitrace::unknown collect-mode '${INPUT_COLLECT_MODE}' — using types"; MODE="types" ;;
+        esac
+
         # --- Obtain the lumitrace gem source -------------------------------
-        # This action is versioned independently of the gem (separate repo), so
-        # it fetches the gem source at run time rather than shipping a copy. No
-        # `gem install`: we shallow-clone the source and put its lib/ on RUBYLIB,
-        # exactly as a co-located checkout used to. Pinned to the latest released
-        # tag by default; override with `lumitrace-ref` for reproducible runs.
+        # Fetch the gem source at run time (no `gem install`) and put its lib/ on
+        # RUBYLIB. Pinned to the latest released tag by default; lumitrace-ref may
+        # override, but only with an immutable ref (vX.Y.Z tag or a commit SHA) so
+        # it can't be pointed at a mutable branch.
         REPO="https://github.com/ko1/lumitrace"
-        REF="${{ inputs.lumitrace-ref }}"
+        REF="$(strip "$INPUT_LUMITRACE_REF")"
+        if [ -n "$REF" ] && ! printf '%s' "$REF" | grep -qE '^(v[0-9]+\.[0-9]+\.[0-9]+|[0-9a-fA-F]{40})$'; then
+          echo "::warning title=lumitrace::ignoring invalid lumitrace-ref (expected vX.Y.Z or a 40-char commit SHA) — using latest release"
+          REF=""
+        fi
         if [ -z "$REF" ]; then
-          # Highest vX.Y.Z semver tag. Filter to X.Y.Z so a bare major float
-          # tag (e.g. an action's `v1`) is never mistaken for a gem release.
           REF="$(git ls-remote --refs --tags "$REPO" 'v*' 2>/dev/null \
                  | sed 's@.*refs/tags/@@' \
                  | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
@@ -63,10 +87,9 @@ runs:
           exit 0
         fi
 
-        DIFF="${{ inputs.diff }}"
         if [ -z "$DIFF" ]; then
-          BASE="${{ github.event.pull_request.base.sha }}"
-          [ -z "$BASE" ] && BASE="${{ github.event.before }}"
+          BASE="$GH_BASE_SHA"
+          [ -z "$BASE" ] && BASE="$GH_BEFORE"
           if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
             DIFF="base:${BASE}"
           else
@@ -80,9 +103,9 @@ runs:
         case "$DIFF" in
           base:*)
             base_rev="${DIFF#base:}"
-            if git -C "$GITHUB_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
-               ! git -C "$GITHUB_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
-              if ! git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null; then
+            if git -C "$GH_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
+               ! git -C "$GH_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
+              if ! git -C "$GH_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null; then
                 echo "::warning title=lumitrace::could not fetch base ${base_rev} — diff range may be empty. Add 'fetch-depth: 0' to actions/checkout (and keep persist-credentials)."
               fi
             fi
@@ -102,13 +125,13 @@ runs:
           echo "RUBYLIB=${LUMI_LIB}${RUBYLIB:+:$RUBYLIB}"
           echo "RUBYOPT=-rlumitrace ${RUBYOPT:-}"
           echo "LUMITRACE_ENABLE=1"
-          echo "LUMITRACE_JSON=${{ inputs.output }}"
-          echo "LUMITRACE_HTML=${{ inputs.html }}"
-          echo "LUMITRACE_ROOT=${{ github.workspace }}"
-          echo "LUMITRACE_COLLECT_MODE=${{ inputs.collect-mode }}"
+          echo "LUMITRACE_JSON=${OUTPUT}"
+          echo "LUMITRACE_HTML=${HTML_OUT}"
+          echo "LUMITRACE_ROOT=${GH_WORKSPACE}"
+          echo "LUMITRACE_COLLECT_MODE=${MODE}"
           echo "LUMITRACE_GIT_DIFF=${DIFF}"
           echo "LUMITRACE_RESULTS_DIR=${RESULTS_DIR}"
           echo "LUMITRACE_RESULTS_PARENT_PID=0"
         } >> "$GITHUB_ENV"
 
-        echo "lumitrace enabled: ref=${REF} mode=${{ inputs.collect-mode }} diff=${DIFF} out=${{ inputs.output }} lib=${LUMI_LIB}"
+        echo "lumitrace enabled: ref=${REF} mode=${MODE} diff=${DIFF} out=${OUTPUT} lib=${LUMI_LIB}"

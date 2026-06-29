@@ -28,9 +28,10 @@ fi
 # Upload to the backend ONLY when an OIDC token is available — i.e. the workflow
 # granted id-token: write. No token, no endpoint, or any failure just means no
 # hosted-report link: this never fails the job (lumitrace never blocks CI).
+# --max-time keeps a hung/slow endpoint from stalling the job.
 DETAILS=""
 if [ -n "$ENDPOINT" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
-  OIDC="$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+  OIDC="$(curl -sS --max-time 15 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
           "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=${AUDIENCE}" 2>/dev/null \
           | ruby -rjson -e 'begin; print JSON.parse(STDIN.read)["value"]; rescue; end' || true)"
   if [ -n "$OIDC" ]; then
@@ -46,7 +47,7 @@ if [ -n "$ENDPOINT" ] && [ -n "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
       gzip -c "$HTML" > "$tmp/lumitrace.html.gz" 2>/dev/null && html_up="$tmp/lumitrace.html.gz"
       html_field=(-F "html=@${html_up}")
     fi
-    VIEW="$(curl -sS -X POST "${ENDPOINT}/api/v1/upload" \
+    VIEW="$(curl -sS --max-time 60 -X POST "${ENDPOINT}/api/v1/upload" \
             -H "Authorization: Bearer $OIDC" \
             -F "json=@${json_up}" "${html_field[@]}" 2>/dev/null \
             | ruby -rjson -e 'begin; print JSON.parse(STDIN.read)["view_url"]; rescue; end' || true)"

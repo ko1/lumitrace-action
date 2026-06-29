@@ -28,14 +28,23 @@ runs:
   using: composite
   steps:
     - shell: bash
+      # All ${{ }} go through env: — never interpolated into the script body.
       env:
         GH_TOKEN: ${{ github.token }}
         LUMITRACE_CHECK_NAME: ${{ inputs.name }}
+        INPUT_OUTPUT: ${{ inputs.output }}
+        INPUT_HTML: ${{ inputs.html }}
+        INPUT_ENDPOINT: ${{ inputs.endpoint }}
+        INPUT_AUDIENCE: ${{ inputs.audience }}
+        GH_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        GH_SHA: ${{ github.sha }}
+        GH_WORKSPACE: ${{ github.workspace }}
       run: |
         set -euo pipefail
 
-        OUT="${{ inputs.output }}"
-        HTML="${{ inputs.html }}"
+        strip() { printf '%s' "${1//$'\r'/}" | tr -d '\n'; }
+        OUT="$(strip "$INPUT_OUTPUT")"
+        HTML="$(strip "$INPUT_HTML")"
 
         # setup cloned the gem source and exported its path. If it's missing,
         # setup didn't run or tracing was disabled (fail-safe) — nothing to do.
@@ -49,7 +58,7 @@ runs:
 
         # Capture the tracing config before we disable it (the merge below reuses it).
         RESULTS_DIR="${LUMITRACE_RESULTS_DIR:-}"
-        ROOT="${LUMITRACE_ROOT:-$GITHUB_WORKSPACE}"
+        ROOT="${LUMITRACE_ROOT:-$GH_WORKSPACE}"
         DIFF="${LUMITRACE_GIT_DIFF:-}"
         MODE="${LUMITRACE_COLLECT_MODE:-last}"
 
@@ -71,13 +80,13 @@ runs:
             ${DIFF:+--git-diff "$DIFF"} || true
         fi
 
-        HEAD_SHA="${{ github.event.pull_request.head.sha }}"
-        [ -z "$HEAD_SHA" ] && HEAD_SHA="${{ github.sha }}"
+        HEAD_SHA="$GH_HEAD_SHA"
+        [ -z "$HEAD_SHA" ] && HEAD_SHA="$GH_SHA"
 
         # Upload (when id-token: write) + post the Check Run — shared with merge/.
         export LUMITRACE_OUT="$OUT" LUMITRACE_HTML_OUT="$HTML" \
-               LUMITRACE_ENDPOINT="${{ inputs.endpoint }}" \
-               LUMITRACE_AUDIENCE="${{ inputs.audience }}" \
+               LUMITRACE_ENDPOINT="$INPUT_ENDPOINT" \
+               LUMITRACE_AUDIENCE="$INPUT_AUDIENCE" \
                LUMITRACE_HEAD_SHA="$HEAD_SHA" \
-               LUMITRACE_WORKSPACE="${{ github.workspace }}"
+               LUMITRACE_WORKSPACE="$GH_WORKSPACE"
         bash "$GITHUB_ACTION_PATH/../scripts/finalize.sh"
