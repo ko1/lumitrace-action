@@ -1,0 +1,124 @@
+name: Lumitrace Merge
+description: >-
+  Combine the per-shard trace results uploaded by several jobs into ONE report
+  and Check Run. Use this when a test suite is sharded across matrix jobs: each
+  shard runs `setup` + tests and uploads its `LUMITRACE_RESULTS_DIR` as an
+  artifact; a final job downloads them all and runs this action. Coverage and
+  "uncovered" are then computed over the combined trace, not per shard.
+inputs:
+  results-dir:
+    description: "Directory the per-shard artifacts were downloaded into (searched recursively for child_*.json)."
+    required: true
+  collect-mode:
+    description: "Must match the mode the shards traced with (last | types | history)."
+    default: "types"
+  output:
+    description: "JSON path to write the merged trace to."
+    default: "lumitrace.json"
+  html:
+    description: "HTML path to write the merged self-contained report to."
+    default: "lumitrace.html"
+  name:
+    description: "Check run name shown on the PR."
+    default: "lumitrace"
+  endpoint:
+    description: >-
+      Backend the merged report is uploaded to. Defaults to lumitrace.atdot.net.
+      Upload only happens when the workflow grants `id-token: write`; set to "" to
+      disable, or point at your own server.
+    default: "https://lumitrace.atdot.net"
+  audience:
+    description: "OIDC audience for the upload (only used when endpoint is set)."
+    default: "lumitrace-ci"
+  diff:
+    description: >-
+      LUMITRACE_GIT_DIFF value used to recompute HTML/coverage range context.
+      Empty = derive from the event (PR base sha) — must match what the shards used.
+    default: ""
+  lumitrace-ref:
+    description: "Tag of ko1/lumitrace to merge with. Empty = the latest released vX.Y.Z."
+    default: ""
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        LUMITRACE_CHECK_NAME: ${{ inputs.name }}
+      run: |
+        set -euo pipefail
+
+        OUT="${{ inputs.output }}"
+        HTML="${{ inputs.html }}"
+        MODE="${{ inputs.collect-mode }}"
+        SRCDIR="${{ inputs.results-dir }}"
+
+        # --- Obtain the lumitrace gem source (same as setup) ----------------
+        REPO="https://github.com/ko1/lumitrace"
+        REF="${{ inputs.lumitrace-ref }}"
+        if [ -z "$REF" ]; then
+          REF="$(git ls-remote --refs --tags "$REPO" 'v*' 2>/dev/null \
+                 | sed 's@.*refs/tags/@@' \
+                 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+                 | sort -V | tail -1)"
+        fi
+        SRC="${RUNNER_TEMP:-/tmp}/lumitrace-src"
+        if [ -z "$REF" ] || ! git clone --depth 1 --branch "$REF" "$REPO" "$SRC" 2>/dev/null; then
+          echo "::warning title=lumitrace::merge skipped — could not fetch lumitrace source (ref='${REF:-?}')"
+          exit 0
+        fi
+        LUMI_LIB="$SRC/lib"
+        LUMI_EXE="$SRC/exe/lumitrace"
+
+        # --- Diff range for HTML/coverage context (same derivation as setup) -
+        DIFF="${{ inputs.diff }}"
+        if [ -z "$DIFF" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+          [ -z "$BASE" ] && BASE="${{ github.event.before }}"
+          if [ -n "$BASE" ] && [ "$BASE" != "0000000000000000000000000000000000000000" ]; then
+            DIFF="base:${BASE}"
+          else
+            DIFF="working"
+          fi
+        fi
+        case "$DIFF" in
+          base:*)
+            base_rev="${DIFF#base:}"
+            if git -C "$GITHUB_WORKSPACE" rev-parse --git-dir >/dev/null 2>&1 &&
+               ! git -C "$GITHUB_WORKSPACE" cat-file -e "${base_rev}^{commit}" 2>/dev/null; then
+              git -C "$GITHUB_WORKSPACE" fetch --no-tags --depth=1 origin "$base_rev" 2>/dev/null \
+                || echo "::warning title=lumitrace::could not fetch base ${base_rev} — range may be empty. Add 'fetch-depth: 0' to actions/checkout in the merge job."
+            fi
+            ;;
+        esac
+
+        # --- Gather every shard's child_*.json into one flat dir -------------
+        # merge globs child_*.json non-recursively, and artifacts may land in
+        # per-artifact subdirs, so collect them under unique names first.
+        FLAT="${RUNNER_TEMP:-/tmp}/lumitrace-merge-in"
+        mkdir -p "$FLAT"
+        count=0
+        while IFS= read -r -d '' f; do
+          cp "$f" "$FLAT/child_$(printf '%08d' "$count").json"
+          count=$((count + 1))
+        done < <(find "$SRCDIR" -type f -name 'child_*.json' -print0 2>/dev/null)
+        echo "lumitrace merge: collected ${count} child result file(s) from ${SRCDIR}"
+        if [ "$count" -eq 0 ]; then
+          echo "lumitrace: no child result files under ${SRCDIR} — nothing to merge."
+          exit 0
+        fi
+
+        ruby -I"$LUMI_LIB" "$LUMI_EXE" merge "$FLAT" \
+          --json "$OUT" --html "$HTML" --root "$GITHUB_WORKSPACE" --collect-mode "$MODE" \
+          ${DIFF:+--git-diff "$DIFF"} || true
+
+        HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+        [ -z "$HEAD_SHA" ] && HEAD_SHA="${{ github.sha }}"
+
+        # Upload (when id-token: write) + post the Check Run — shared with report/.
+        export LUMITRACE_OUT="$OUT" LUMITRACE_HTML_OUT="$HTML" \
+               LUMITRACE_ENDPOINT="${{ inputs.endpoint }}" \
+               LUMITRACE_AUDIENCE="${{ inputs.audience }}" \
+               LUMITRACE_HEAD_SHA="$HEAD_SHA" \
+               LUMITRACE_WORKSPACE="${{ github.workspace }}"
+        bash "$GITHUB_ACTION_PATH/../scripts/finalize.sh"

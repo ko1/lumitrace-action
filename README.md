@@ -95,6 +95,88 @@ without it you still get ① + ②.
 | `endpoint` | `https://lumitrace.atdot.net` | Backend the report is uploaded to. Upload only happens when the workflow grants `id-token: write`; set to `""` to disable, or point at your own server. |
 | `audience` | `lumitrace-ci` | OIDC audience for the upload. |
 
+### `merge`
+
+Used instead of `report` when the suite is sharded across jobs (see
+[Sharded test suites](#sharded-test-suites)).
+
+| input | default | description |
+|---|---|---|
+| `results-dir` | _(required)_ | Directory the per-shard artifacts were downloaded into (searched **recursively** for `child_*.json`). |
+| `collect-mode` | `types` | Must match the mode the shards traced with. |
+| `output` | `lumitrace.json` | Merged JSON path. |
+| `html` | `lumitrace.html` | Merged HTML path. |
+| `name` | `lumitrace` | Check run name shown on the PR. |
+| `endpoint` | `https://lumitrace.atdot.net` | Backend for the merged report (same rules as `report`). |
+| `audience` | `lumitrace-ci` | OIDC audience for the upload. |
+| `diff` | _(auto)_ | Range context for HTML/coverage; empty = derive from the PR base (must match the shards). |
+| `lumitrace-ref` | _(latest)_ | Tag of `ko1/lumitrace` to merge with. |
+
+## Sharded test suites
+
+If you split your tests across matrix jobs, **don't run `report` in each shard** —
+each shard only traces its own slice, so every shard would post its own check and
+flag the lines other shards covered as "uncovered". Instead, each shard uploads
+its results as an artifact, and one final job merges them into a single report and
+check with `merge`:
+
+```yaml
+name: test
+on: pull_request
+
+permissions:
+  checks: write
+  contents: read
+  id-token: write   # for the hosted report (on the merge job)
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ruby/setup-ruby@v1
+        with: { bundler-cache: true }
+
+      - uses: ko1/lumitrace-action/setup@v1
+
+      # Run only this shard's tests — however you split them (by directory, a
+      # sharding plugin, TEST_ENV_NUMBER, ci-queue, etc.).
+      - run: bin/rails test "test/shard_${{ matrix.shard }}"
+
+      # Stash this shard's per-process trace results; the merge job collects them.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: lumitrace-results-${{ matrix.shard }}
+          path: ${{ env.LUMITRACE_RESULTS_DIR }}
+          include-hidden-files: true
+          if-no-files-found: ignore
+
+  lumitrace:
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4   # needed to render HTML + compute the diff range
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lumitrace-results-*
+          path: lumitrace-results
+
+      - uses: ko1/lumitrace-action/merge@v1
+        with:
+          results-dir: lumitrace-results
+          # collect-mode: last   # if your shards used a non-default mode
+```
+
+`setup` exports `LUMITRACE_RESULTS_DIR` (each shard writes one `child_<pid>_<ts>.json`
+per traced process there). `merge` gathers every shard's child files and produces one
+`lumitrace.json` + `lumitrace.html`, then posts a single Check Run — coverage and
+"uncovered" computed over the **combined** trace.
+
 ## Notes
 
 - **No `gem install`.** `setup` shallow-clones the `ko1/lumitrace` source at run
